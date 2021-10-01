@@ -1,0 +1,1696 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="326" onload="init(evt)" viewBox="0 0 1200 326" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				clearzoom();
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="326.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="309" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="309" > </text>
+<g id="frames">
+<g >
+<title>sudachi::dic::lexicon::word_infos::WordInfos::get_word_info (3,830 samples, 0.38%)</title><rect x="1016.3" y="101" width="4.4" height="15.0" fill="rgb(234,9,16)" rx="2" ry="2" />
+<text  x="1019.29" y="111.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::dic::lexicon::word_infos::WordInfo&gt; (422 samples, 0.04%)</title><rect x="1068.8" y="165" width="0.5" height="15.0" fill="rgb(210,133,0)" rx="2" ry="2" />
+<text  x="1071.85" y="175.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::is_match (359 samples, 0.04%)</title><rect x="248.8" y="101" width="0.4" height="15.0" fill="rgb(228,152,18)" rx="2" ry="2" />
+<text  x="251.83" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::input_text::default_input_text::DefaultInputTextPlugin as sudachi::plugin::input_text::InputTextPlugin&gt;::rewrite (37,993 samples, 3.73%)</title><rect x="272.8" y="149" width="44.0" height="15.0" fill="rgb(224,79,8)" rx="2" ry="2" />
+<text  x="275.83" y="159.5" >&lt;sud..</text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (766 samples, 0.08%)</title><rect x="1035.7" y="117" width="0.9" height="15.0" fill="rgb(234,81,24)" rx="2" ry="2" />
+<text  x="1038.73" y="127.5" ></text>
+</g>
+<g >
+<title>core::iter::adapters::process_results (21,489 samples, 2.11%)</title><rect x="389.9" y="149" width="24.9" height="15.0" fill="rgb(225,214,53)" rx="2" ry="2" />
+<text  x="392.93" y="159.5" >c..</text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (804 samples, 0.08%)</title><rect x="307.1" y="133" width="0.9" height="15.0" fill="rgb(236,4,40)" rx="2" ry="2" />
+<text  x="310.11" y="143.5" ></text>
+</g>
+<g >
+<title>all (1,019,435 samples, 100%)</title><rect x="10.0" y="277" width="1180.0" height="15.0" fill="rgb(239,164,42)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::capture_locations (393 samples, 0.04%)</title><rect x="142.0" y="101" width="0.5" height="15.0" fill="rgb(228,112,19)" rx="2" ry="2" />
+<text  x="145.00" y="111.5" ></text>
+</g>
+<g >
+<title>__rust_dealloc (616 samples, 0.06%)</title><rect x="383.2" y="149" width="0.7" height="15.0" fill="rgb(219,121,22)" rx="2" ry="2" />
+<text  x="386.20" y="159.5" ></text>
+</g>
+<g >
+<title>sudachi::morpheme::Morpheme::pos (702 samples, 0.07%)</title><rect x="1075.6" y="165" width="0.9" height="15.0" fill="rgb(205,60,29)" rx="2" ry="2" />
+<text  x="1078.64" y="175.5" ></text>
+</g>
+<g >
+<title>malloc (21,147 samples, 2.07%)</title><rect x="1147.1" y="245" width="24.5" height="15.0" fill="rgb(254,128,44)" rx="2" ry="2" />
+<text  x="1150.09" y="255.5" >m..</text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (943 samples, 0.09%)</title><rect x="448.0" y="101" width="1.1" height="15.0" fill="rgb(237,65,32)" rx="2" ry="2" />
+<text  x="451.02" y="111.5" ></text>
+</g>
+<g >
+<title>sudachi (1,019,419 samples, 100.00%)</title><rect x="10.0" y="261" width="1180.0" height="15.0" fill="rgb(231,188,53)" rx="2" ry="2" />
+<text  x="13.02" y="271.5" >sudachi</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::fold (1,576 samples, 0.15%)</title><rect x="337.7" y="117" width="1.8" height="15.0" fill="rgb(247,5,5)" rx="2" ry="2" />
+<text  x="340.67" y="127.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (1,171 samples, 0.11%)</title><rect x="134.7" y="133" width="1.3" height="15.0" fill="rgb(227,172,21)" rx="2" ry="2" />
+<text  x="137.66" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (4,383 samples, 0.43%)</title><rect x="507.6" y="117" width="5.1" height="15.0" fill="rgb(232,99,19)" rx="2" ry="2" />
+<text  x="510.59" y="127.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::HashMap&lt;K,V,S,A&gt;::insert (2,126 samples, 0.21%)</title><rect x="339.7" y="101" width="2.5" height="15.0" fill="rgb(241,150,11)" rx="2" ry="2" />
+<text  x="342.73" y="111.5" ></text>
+</g>
+<g >
+<title>std::sys_common::backtrace::__rust_begin_short_backtrace (822,275 samples, 80.66%)</title><rect x="125.4" y="197" width="951.8" height="15.0" fill="rgb(238,128,13)" rx="2" ry="2" />
+<text  x="128.45" y="207.5" >std::sys_common::backtrace::__rust_begin_short_backtrace</text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (12,234 samples, 1.20%)</title><rect x="567.5" y="133" width="14.2" height="15.0" fill="rgb(209,123,5)" rx="2" ry="2" />
+<text  x="570.51" y="143.5" ></text>
+</g>
+<g >
+<title>regex::literal::imp::LiteralSearcher::find_start (6,786 samples, 0.67%)</title><rect x="240.4" y="53" width="7.9" height="15.0" fill="rgb(243,98,11)" rx="2" ry="2" />
+<text  x="243.43" y="63.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::get_best_path (4,884 samples, 0.48%)</title><rect x="593.1" y="149" width="5.7" height="15.0" fill="rgb(217,167,46)" rx="2" ry="2" />
+<text  x="596.10" y="159.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (508 samples, 0.05%)</title><rect x="465.1" y="101" width="0.6" height="15.0" fill="rgb(218,223,20)" rx="2" ry="2" />
+<text  x="468.15" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (403 samples, 0.04%)</title><rect x="343.8" y="85" width="0.5" height="15.0" fill="rgb(244,161,22)" rx="2" ry="2" />
+<text  x="346.84" y="95.5" ></text>
+</g>
+<g >
+<title>std::io::Write::write_fmt (1,169 samples, 0.11%)</title><rect x="1069.8" y="165" width="1.4" height="15.0" fill="rgb(221,180,26)" rx="2" ry="2" />
+<text  x="1072.83" y="175.5" ></text>
+</g>
+<g >
+<title>realloc (372 samples, 0.04%)</title><rect x="12.3" y="165" width="0.4" height="15.0" fill="rgb(234,58,21)" rx="2" ry="2" />
+<text  x="15.28" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (7,747 samples, 0.76%)</title><rect x="582.6" y="133" width="8.9" height="15.0" fill="rgb(235,167,33)" rx="2" ry="2" />
+<text  x="585.55" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::Lexicon::get_word_param (666 samples, 0.07%)</title><rect x="420.2" y="149" width="0.8" height="15.0" fill="rgb(214,53,31)" rx="2" ry="2" />
+<text  x="423.20" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (2,003 samples, 0.20%)</title><rect x="11.8" y="229" width="2.4" height="15.0" fill="rgb(205,96,5)" rx="2" ry="2" />
+<text  x="14.83" y="239.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text_builder::Utf8InputTextBuilder::replace (1,081 samples, 0.11%)</title><rect x="315.4" y="133" width="1.2" height="15.0" fill="rgb(219,19,28)" rx="2" ry="2" />
+<text  x="318.37" y="143.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (5,165 samples, 0.51%)</title><rect x="657.0" y="117" width="6.0" height="15.0" fill="rgb(248,170,13)" rx="2" ry="2" />
+<text  x="659.99" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_cost (28,441 samples, 2.79%)</title><rect x="432.8" y="117" width="32.9" height="15.0" fill="rgb(233,97,47)" rx="2" ry="2" />
+<text  x="435.82" y="127.5" >su..</text>
+</g>
+<g >
+<title>core::str::converts::from_utf8 (943 samples, 0.09%)</title><rect x="1146.0" y="245" width="1.1" height="15.0" fill="rgb(247,63,9)" rx="2" ry="2" />
+<text  x="1149.00" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;std::io::buffered::bufwriter::BufWriter&lt;W&gt; as std::io::Write&gt;::flush (1,934 samples, 0.19%)</title><rect x="134.4" y="165" width="2.2" height="15.0" fill="rgb(214,113,40)" rx="2" ry="2" />
+<text  x="137.36" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::chain::Chain&lt;A,B&gt; as core::iter::traits::iterator::Iterator&gt;::size_hint (324 samples, 0.03%)</title><rect x="590.0" y="117" width="0.3" height="15.0" fill="rgb(225,202,33)" rx="2" ry="2" />
+<text  x="592.96" y="127.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::error::SudachiError&gt; (4,908 samples, 0.48%)</title><rect x="538.8" y="101" width="5.7" height="15.0" fill="rgb(221,125,27)" rx="2" ry="2" />
+<text  x="541.77" y="111.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (271 samples, 0.03%)</title><rect x="432.5" y="117" width="0.3" height="15.0" fill="rgb(231,30,39)" rx="2" ry="2" />
+<text  x="435.50" y="127.5" ></text>
+</g>
+<g >
+<title>regex::backtrack::Bounded&lt;I&gt;::backtrack (842 samples, 0.08%)</title><rect x="146.8" y="37" width="1.0" height="15.0" fill="rgb(228,25,7)" rx="2" ry="2" />
+<text  x="149.81" y="47.5" ></text>
+</g>
+<g >
+<title>__libc_start_main (822,276 samples, 80.66%)</title><rect x="125.4" y="245" width="951.8" height="15.0" fill="rgb(207,3,35)" rx="2" ry="2" />
+<text  x="128.44" y="255.5" >__libc_start_main</text>
+</g>
+<g >
+<title>sudachi::plugin::path_rewrite::join_numeric::numeric_parser::NumericParser::append (707 samples, 0.07%)</title><rect x="336.6" y="133" width="0.8" height="15.0" fill="rgb(247,106,10)" rx="2" ry="2" />
+<text  x="339.60" y="143.5" ></text>
+</g>
+<g >
+<title>core::fmt::num::imp::&lt;impl core::fmt::Display for i32&gt;::fmt (1,154 samples, 0.11%)</title><rect x="343.2" y="117" width="1.4" height="15.0" fill="rgb(228,97,2)" rx="2" ry="2" />
+<text  x="346.22" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_left_id (515 samples, 0.05%)</title><rect x="491.5" y="133" width="0.6" height="15.0" fill="rgb(249,106,25)" rx="2" ry="2" />
+<text  x="494.47" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::input_text::prolonged_sound_mark::ProlongedSoundMarkPlugin as sudachi::plugin::input_text::InputTextPlugin&gt;::rewrite (4,771 samples, 0.47%)</title><rect x="324.4" y="149" width="5.5" height="15.0" fill="rgb(219,175,49)" rx="2" ry="2" />
+<text  x="327.35" y="159.5" ></text>
+</g>
+<g >
+<title>realloc (416 samples, 0.04%)</title><rect x="12.9" y="197" width="0.5" height="15.0" fill="rgb(225,5,44)" rx="2" ry="2" />
+<text  x="15.92" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;std::io::Lines&lt;B&gt; as core::iter::traits::iterator::Iterator&gt;::next (1,502 samples, 0.15%)</title><rect x="132.6" y="165" width="1.8" height="15.0" fill="rgb(254,136,3)" rx="2" ry="2" />
+<text  x="135.62" y="175.5" ></text>
+</g>
+<g >
+<title>alloc_perturb (273 samples, 0.03%)</title><rect x="109.8" y="229" width="0.3" height="15.0" fill="rgb(240,201,38)" rx="2" ry="2" />
+<text  x="112.78" y="239.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::grammar::Grammar::get_connect_cost (468 samples, 0.05%)</title><rect x="592.1" y="133" width="0.6" height="15.0" fill="rgb(228,223,7)" rx="2" ry="2" />
+<text  x="595.12" y="143.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (2,192 samples, 0.22%)</title><rect x="304.5" y="133" width="2.6" height="15.0" fill="rgb(251,100,7)" rx="2" ry="2" />
+<text  x="307.53" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (717 samples, 0.07%)</title><rect x="419.4" y="149" width="0.8" height="15.0" fill="rgb(214,220,16)" rx="2" ry="2" />
+<text  x="422.36" y="159.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_id_table::WordIdTable::get (12,785 samples, 1.25%)</title><rect x="544.5" y="117" width="14.8" height="15.0" fill="rgb(211,112,39)" rx="2" ry="2" />
+<text  x="547.45" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (2,300 samples, 0.23%)</title><rect x="125.6" y="181" width="2.6" height="15.0" fill="rgb(227,219,39)" rx="2" ry="2" />
+<text  x="128.58" y="191.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::trie::Trie::common_prefix_search (25,589 samples, 2.51%)</title><rect x="514.8" y="117" width="29.7" height="15.0" fill="rgb(215,86,4)" rx="2" ry="2" />
+<text  x="517.83" y="127.5" >su..</text>
+</g>
+<g >
+<title>core::fmt::Formatter::pad_integral (261 samples, 0.03%)</title><rect x="110.1" y="229" width="0.3" height="15.0" fill="rgb(230,225,4)" rx="2" ry="2" />
+<text  x="113.10" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::fold (606 samples, 0.06%)</title><rect x="302.1" y="133" width="0.7" height="15.0" fill="rgb(234,161,1)" rx="2" ry="2" />
+<text  x="305.08" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (283 samples, 0.03%)</title><rect x="405.6" y="85" width="0.4" height="15.0" fill="rgb(205,85,31)" rx="2" ry="2" />
+<text  x="408.65" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::path_rewrite::join_katakana_oov::JoinKatakanaOovPlugin as sudachi::plugin::path_rewrite::PathRewritePlugin&gt;::rewrite (1,377 samples, 0.14%)</title><rect x="330.1" y="149" width="1.6" height="15.0" fill="rgb(210,228,7)" rx="2" ry="2" />
+<text  x="333.12" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::map::Map&lt;I,F&gt; as core::iter::traits::iterator::Iterator&gt;::try_fold (14,051 samples, 1.38%)</title><rect x="391.0" y="117" width="16.2" height="15.0" fill="rgb(235,67,47)" rx="2" ry="2" />
+<text  x="393.98" y="127.5" ></text>
+</g>
+<g >
+<title>__memset_sse2_unaligned_erms (292 samples, 0.03%)</title><rect x="381.7" y="149" width="0.3" height="15.0" fill="rgb(233,109,44)" rx="2" ry="2" />
+<text  x="384.69" y="159.5" ></text>
+</g>
+<g >
+<title>ksys_write (884 samples, 0.09%)</title><rect x="134.8" y="101" width="1.0" height="15.0" fill="rgb(243,173,41)" rx="2" ry="2" />
+<text  x="137.78" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (305 samples, 0.03%)</title><rect x="598.1" y="133" width="0.4" height="15.0" fill="rgb(206,61,27)" rx="2" ry="2" />
+<text  x="601.13" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text_builder::Utf8InputTextBuilder::build (15,462 samples, 1.52%)</title><rect x="564.6" y="149" width="17.8" height="15.0" fill="rgb(232,50,15)" rx="2" ry="2" />
+<text  x="567.55" y="159.5" ></text>
+</g>
+<g >
+<title>realloc (487 samples, 0.05%)</title><rect x="13.6" y="213" width="0.5" height="15.0" fill="rgb(216,115,10)" rx="2" ry="2" />
+<text  x="16.55" y="223.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (6,634 samples, 0.65%)</title><rect x="1138.3" y="245" width="7.7" height="15.0" fill="rgb(209,165,7)" rx="2" ry="2" />
+<text  x="1141.32" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (31,127 samples, 3.05%)</title><rect x="345.6" y="149" width="36.1" height="15.0" fill="rgb(205,98,46)" rx="2" ry="2" />
+<text  x="348.64" y="159.5" >__m..</text>
+</g>
+<g >
+<title>do_syscall_64 (1,123 samples, 0.11%)</title><rect x="134.7" y="117" width="1.3" height="15.0" fill="rgb(235,122,43)" rx="2" ry="2" />
+<text  x="137.71" y="127.5" ></text>
+</g>
+<g >
+<title>regex::dfa::Fsm::next_state (1,189 samples, 0.12%)</title><rect x="209.3" y="53" width="1.4" height="15.0" fill="rgb(234,6,34)" rx="2" ry="2" />
+<text  x="212.28" y="63.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;mut I as core::iter::traits::iterator::Iterator&gt;::next (9,772 samples, 0.96%)</title><rect x="286.1" y="117" width="11.3" height="15.0" fill="rgb(233,102,25)" rx="2" ry="2" />
+<text  x="289.11" y="127.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u32 (688 samples, 0.07%)</title><rect x="558.5" y="101" width="0.8" height="15.0" fill="rgb(254,6,19)" rx="2" ry="2" />
+<text  x="561.46" y="111.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (3,913 samples, 0.38%)</title><rect x="394.7" y="101" width="4.6" height="15.0" fill="rgb(211,3,19)" rx="2" ry="2" />
+<text  x="397.72" y="111.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_left_id (11,484 samples, 1.13%)</title><rect x="465.7" y="117" width="13.3" height="15.0" fill="rgb(249,116,33)" rx="2" ry="2" />
+<text  x="468.74" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (1,269 samples, 0.12%)</title><rect x="431.0" y="117" width="1.5" height="15.0" fill="rgb(213,38,27)" rx="2" ry="2" />
+<text  x="434.02" y="127.5" ></text>
+</g>
+<g >
+<title>fancy_regex::Regex::is_match (440 samples, 0.04%)</title><rect x="249.9" y="133" width="0.5" height="15.0" fill="rgb(249,88,51)" rx="2" ry="2" />
+<text  x="252.88" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (402 samples, 0.04%)</title><rect x="617.3" y="117" width="0.5" height="15.0" fill="rgb(221,88,14)" rx="2" ry="2" />
+<text  x="620.32" y="127.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (305 samples, 0.03%)</title><rect x="410.2" y="117" width="0.3" height="15.0" fill="rgb(251,1,3)" rx="2" ry="2" />
+<text  x="413.16" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (4,277 samples, 0.42%)</title><rect x="443.1" y="101" width="4.9" height="15.0" fill="rgb(240,85,0)" rx="2" ry="2" />
+<text  x="446.07" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::stateless_tokeniser::StatelessTokenizer&lt;T&gt; as sudachi::tokenizer::Tokenize&gt;::tokenize (685,219 samples, 67.22%)</title><rect x="250.5" y="165" width="793.1" height="15.0" fill="rgb(234,3,45)" rx="2" ry="2" />
+<text  x="253.46" y="175.5" >&lt;sudachi::stateless_tokeniser::StatelessTokenizer&lt;T&gt; as sudachi::tokenizer::Tokenize&gt;::tokenize</text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T,A&gt; as core::ops::drop::Drop&gt;::drop (4,202 samples, 0.41%)</title><rect x="266.7" y="149" width="4.8" height="15.0" fill="rgb(250,48,1)" rx="2" ry="2" />
+<text  x="269.68" y="159.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::DictionaryLoader::read_system_dictionary (373 samples, 0.04%)</title><rect x="1071.2" y="133" width="0.4" height="15.0" fill="rgb(254,143,22)" rx="2" ry="2" />
+<text  x="1074.19" y="143.5" ></text>
+</g>
+<g >
+<title>__rdl_alloc (319 samples, 0.03%)</title><rect x="613.3" y="117" width="0.4" height="15.0" fill="rgb(212,187,3)" rx="2" ry="2" />
+<text  x="616.32" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (4,594 samples, 0.45%)</title><rect x="484.6" y="101" width="5.4" height="15.0" fill="rgb(209,226,0)" rx="2" ry="2" />
+<text  x="487.64" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::raw::RawIterHash&lt;T,A&gt; as core::iter::traits::iterator::Iterator&gt;::next (1,128 samples, 0.11%)</title><rect x="302.8" y="133" width="1.3" height="15.0" fill="rgb(230,185,53)" rx="2" ry="2" />
+<text  x="305.78" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::grammar::Grammar::get_connect_cost (3,471 samples, 0.34%)</title><rect x="618.5" y="133" width="4.1" height="15.0" fill="rgb(221,51,32)" rx="2" ry="2" />
+<text  x="621.54" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::path_rewrite::join_numeric::JoinNumericPlugin as sudachi::plugin::path_rewrite::PathRewritePlugin&gt;::rewrite (11,474 samples, 1.13%)</title><rect x="331.7" y="149" width="13.3" height="15.0" fill="rgb(232,137,16)" rx="2" ry="2" />
+<text  x="334.71" y="159.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (3,610 samples, 0.35%)</title><rect x="474.6" y="85" width="4.1" height="15.0" fill="rgb(233,0,7)" rx="2" ry="2" />
+<text  x="477.57" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (6,397 samples, 0.63%)</title><rect x="471.3" y="101" width="7.4" height="15.0" fill="rgb(247,23,37)" rx="2" ry="2" />
+<text  x="474.34" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::dic::dictionary::JapaneseDictionary as sudachi::stateless_tokeniser::DictionaryAccess&gt;::lexicon (595 samples, 0.06%)</title><rect x="271.9" y="149" width="0.7" height="15.0" fill="rgb(229,186,1)" rx="2" ry="2" />
+<text  x="274.89" y="159.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (525 samples, 0.05%)</title><rect x="580.6" y="117" width="0.6" height="15.0" fill="rgb(239,224,7)" rx="2" ry="2" />
+<text  x="583.64" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (2,073 samples, 0.20%)</title><rect x="974.2" y="117" width="2.4" height="15.0" fill="rgb(238,183,19)" rx="2" ry="2" />
+<text  x="977.17" y="127.5" ></text>
+</g>
+<g >
+<title>realloc (380 samples, 0.04%)</title><rect x="617.8" y="117" width="0.4" height="15.0" fill="rgb(228,97,1)" rx="2" ry="2" />
+<text  x="620.79" y="127.5" ></text>
+</g>
+<g >
+<title>alloc::str::join_generic_copy (4,739 samples, 0.46%)</title><rect x="1060.7" y="165" width="5.5" height="15.0" fill="rgb(214,36,43)" rx="2" ry="2" />
+<text  x="1063.70" y="175.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text::Utf8InputText::get_char_category_types (324 samples, 0.03%)</title><rect x="564.2" y="149" width="0.4" height="15.0" fill="rgb(212,193,16)" rx="2" ry="2" />
+<text  x="567.18" y="159.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (1,038 samples, 0.10%)</title><rect x="511.0" y="101" width="1.2" height="15.0" fill="rgb(221,0,10)" rx="2" ry="2" />
+<text  x="514.05" y="111.5" ></text>
+</g>
+<g >
+<title>std::io::read_until (339 samples, 0.03%)</title><rect x="133.8" y="117" width="0.4" height="15.0" fill="rgb(213,143,41)" rx="2" ry="2" />
+<text  x="136.77" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text::Utf8InputText::get_original_substring (1,097 samples, 0.11%)</title><rect x="406.0" y="85" width="1.2" height="15.0" fill="rgb(216,168,16)" rx="2" ry="2" />
+<text  x="408.97" y="95.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::shortest_match_at (406 samples, 0.04%)</title><rect x="249.9" y="101" width="0.5" height="15.0" fill="rgb(224,203,16)" rx="2" ry="2" />
+<text  x="252.91" y="111.5" ></text>
+</g>
+<g >
+<title>realloc (4,278 samples, 0.42%)</title><rect x="111.1" y="229" width="5.0" height="15.0" fill="rgb(231,145,51)" rx="2" ry="2" />
+<text  x="114.13" y="239.5" ></text>
+</g>
+<g >
+<title>sudachi::plugin::oov::mecab_oov::MeCabOovPlugin::get_oov_node (1,214 samples, 0.12%)</title><rect x="1040.0" y="117" width="1.4" height="15.0" fill="rgb(231,137,49)" rx="2" ry="2" />
+<text  x="1043.01" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (13,432 samples, 1.32%)</title><rect x="988.2" y="85" width="15.6" height="15.0" fill="rgb(240,193,24)" rx="2" ry="2" />
+<text  x="991.22" y="95.5" ></text>
+</g>
+<g >
+<title>unicode_normalization::lookups::compatibility_fully_decomposed (2,005 samples, 0.20%)</title><rect x="295.0" y="101" width="2.4" height="15.0" fill="rgb(208,96,12)" rx="2" ry="2" />
+<text  x="298.04" y="111.5" ></text>
+</g>
+<g >
+<title>regex::literal::imp::LiteralSearcher::find_start (296 samples, 0.03%)</title><rect x="212.3" y="69" width="0.3" height="15.0" fill="rgb(248,36,30)" rx="2" ry="2" />
+<text  x="215.29" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (384 samples, 0.04%)</title><rect x="304.1" y="133" width="0.4" height="15.0" fill="rgb(210,166,22)" rx="2" ry="2" />
+<text  x="307.09" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (312 samples, 0.03%)</title><rect x="383.9" y="149" width="0.4" height="15.0" fill="rgb(212,54,20)" rx="2" ry="2" />
+<text  x="386.91" y="159.5" ></text>
+</g>
+<g >
+<title>fancy_regex::Regex::find_from_pos (87,256 samples, 8.56%)</title><rect x="148.2" y="117" width="101.0" height="15.0" fill="rgb(220,48,26)" rx="2" ry="2" />
+<text  x="151.25" y="127.5" >fancy_regex:..</text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::connect_eos_node (643 samples, 0.06%)</title><rect x="591.9" y="149" width="0.8" height="15.0" fill="rgb(226,223,23)" rx="2" ry="2" />
+<text  x="594.92" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::lattice::node::Node as core::clone::Clone&gt;::clone (1,668 samples, 0.16%)</title><rect x="594.3" y="133" width="1.9" height="15.0" fill="rgb(218,210,10)" rx="2" ry="2" />
+<text  x="597.30" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;str as core::fmt::Display&gt;::fmt (443 samples, 0.04%)</title><rect x="11.2" y="245" width="0.5" height="15.0" fill="rgb(220,52,47)" rx="2" ry="2" />
+<text  x="14.23" y="255.5" ></text>
+</g>
+<g >
+<title>__rdl_alloc (514 samples, 0.05%)</title><rect x="399.3" y="101" width="0.5" height="15.0" fill="rgb(248,202,53)" rx="2" ry="2" />
+<text  x="402.25" y="111.5" ></text>
+</g>
+<g >
+<title>malloc (468 samples, 0.05%)</title><rect x="1039.5" y="117" width="0.5" height="15.0" fill="rgb(233,209,54)" rx="2" ry="2" />
+<text  x="1042.47" y="127.5" ></text>
+</g>
+<g >
+<title>__rdl_realloc (798 samples, 0.08%)</title><rect x="1086.4" y="245" width="0.9" height="15.0" fill="rgb(212,209,0)" rx="2" ry="2" />
+<text  x="1089.42" y="255.5" ></text>
+</g>
+<g >
+<title>__rdl_realloc (673 samples, 0.07%)</title><rect x="613.7" y="117" width="0.8" height="15.0" fill="rgb(221,106,2)" rx="2" ry="2" />
+<text  x="616.69" y="127.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (268 samples, 0.03%)</title><rect x="581.4" y="117" width="0.3" height="15.0" fill="rgb(213,123,33)" rx="2" ry="2" />
+<text  x="584.36" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon_set::LexiconSet::lookup (57,788 samples, 5.67%)</title><rect x="492.7" y="149" width="66.9" height="15.0" fill="rgb(227,227,4)" rx="2" ry="2" />
+<text  x="495.67" y="159.5" >sudachi..</text>
+</g>
+<g >
+<title>malloc (348 samples, 0.03%)</title><rect x="538.2" y="85" width="0.5" height="15.0" fill="rgb(238,191,28)" rx="2" ry="2" />
+<text  x="541.25" y="95.5" ></text>
+</g>
+<g >
+<title>__rdl_dealloc (335 samples, 0.03%)</title><rect x="382.6" y="149" width="0.4" height="15.0" fill="rgb(218,37,29)" rx="2" ry="2" />
+<text  x="385.60" y="159.5" ></text>
+</g>
+<g >
+<title>__memcmp_sse4_1 (521 samples, 0.05%)</title><rect x="345.0" y="149" width="0.6" height="15.0" fill="rgb(221,16,19)" rx="2" ry="2" />
+<text  x="348.04" y="159.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (323 samples, 0.03%)</title><rect x="180.2" y="85" width="0.3" height="15.0" fill="rgb(225,200,51)" rx="2" ry="2" />
+<text  x="183.16" y="95.5" ></text>
+</g>
+<g >
+<title>__memchr_sse2 (408 samples, 0.04%)</title><rect x="133.2" y="117" width="0.4" height="15.0" fill="rgb(241,156,34)" rx="2" ry="2" />
+<text  x="136.16" y="127.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::error::SudachiError&gt; (363 samples, 0.04%)</title><rect x="415.4" y="149" width="0.5" height="15.0" fill="rgb(211,160,42)" rx="2" ry="2" />
+<text  x="418.43" y="159.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::dic::lexicon::word_infos::WordInfo&gt; (327 samples, 0.03%)</title><rect x="271.2" y="133" width="0.3" height="15.0" fill="rgb(236,198,6)" rx="2" ry="2" />
+<text  x="274.17" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::chain::Chain&lt;A,B&gt; as core::iter::traits::iterator::Iterator&gt;::next (552 samples, 0.05%)</title><rect x="581.7" y="133" width="0.6" height="15.0" fill="rgb(229,166,41)" rx="2" ry="2" />
+<text  x="584.67" y="143.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::is_match (415 samples, 0.04%)</title><rect x="249.9" y="117" width="0.5" height="15.0" fill="rgb(227,184,6)" rx="2" ry="2" />
+<text  x="252.90" y="127.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (469 samples, 0.05%)</title><rect x="590.4" y="117" width="0.6" height="15.0" fill="rgb(253,19,17)" rx="2" ry="2" />
+<text  x="593.45" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::input_text::ignore_yomigana::IgnoreYomiganaPlugin as sudachi::plugin::input_text::InputTextPlugin&gt;::rewrite (6,516 samples, 0.64%)</title><rect x="316.8" y="149" width="7.6" height="15.0" fill="rgb(234,26,47)" rx="2" ry="2" />
+<text  x="319.81" y="159.5" ></text>
+</g>
+<g >
+<title>realloc (504 samples, 0.05%)</title><rect x="1185.7" y="245" width="0.6" height="15.0" fill="rgb(254,197,22)" rx="2" ry="2" />
+<text  x="1188.69" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (926 samples, 0.09%)</title><rect x="1042.0" y="133" width="1.0" height="15.0" fill="rgb(207,189,38)" rx="2" ry="2" />
+<text  x="1044.97" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::morpheme::Morpheme::new (5,100 samples, 0.50%)</title><rect x="401.3" y="101" width="5.9" height="15.0" fill="rgb(220,120,29)" rx="2" ry="2" />
+<text  x="404.34" y="111.5" ></text>
+</g>
+<g >
+<title>_int_malloc (56,945 samples, 5.59%)</title><rect x="42.7" y="229" width="65.9" height="15.0" fill="rgb(224,193,29)" rx="2" ry="2" />
+<text  x="45.73" y="239.5" >_int_ma..</text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text_builder::Utf8InputTextBuilder::new (8,174 samples, 0.80%)</title><rect x="582.4" y="149" width="9.5" height="15.0" fill="rgb(236,179,29)" rx="2" ry="2" />
+<text  x="585.45" y="159.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (14,128 samples, 1.39%)</title><rect x="1043.6" y="165" width="16.4" height="15.0" fill="rgb(215,100,50)" rx="2" ry="2" />
+<text  x="1046.60" y="175.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::LoadedDictionary::from_system_dictionary (375 samples, 0.04%)</title><rect x="1071.2" y="149" width="0.4" height="15.0" fill="rgb(217,164,26)" rx="2" ry="2" />
+<text  x="1074.19" y="159.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (527 samples, 0.05%)</title><rect x="1037.7" y="117" width="0.6" height="15.0" fill="rgb(215,198,30)" rx="2" ry="2" />
+<text  x="1040.67" y="127.5" ></text>
+</g>
+<g >
+<title>unicode_normalization::lookups::canonical_combining_class (682 samples, 0.07%)</title><rect x="299.5" y="117" width="0.8" height="15.0" fill="rgb(215,111,36)" rx="2" ry="2" />
+<text  x="302.47" y="127.5" ></text>
+</g>
+<g >
+<title>__libc_write (1,457 samples, 0.14%)</title><rect x="134.4" y="149" width="1.7" height="15.0" fill="rgb(222,129,51)" rx="2" ry="2" />
+<text  x="137.44" y="159.5" ></text>
+</g>
+<g >
+<title>__rdl_alloc (271 samples, 0.03%)</title><rect x="976.6" y="117" width="0.3" height="15.0" fill="rgb(232,96,31)" rx="2" ry="2" />
+<text  x="979.57" y="127.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (7,399 samples, 0.73%)</title><rect x="609.7" y="133" width="8.5" height="15.0" fill="rgb(234,82,27)" rx="2" ry="2" />
+<text  x="612.66" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::node::Node::new (729 samples, 0.07%)</title><rect x="1074.7" y="165" width="0.9" height="15.0" fill="rgb(218,36,32)" rx="2" ry="2" />
+<text  x="1077.74" y="175.5" ></text>
+</g>
+<g >
+<title>__memcmp_sse4_1 (1,889 samples, 0.19%)</title><rect x="148.4" y="101" width="2.2" height="15.0" fill="rgb(207,85,48)" rx="2" ry="2" />
+<text  x="151.40" y="111.5" ></text>
+</g>
+<g >
+<title>&lt; (3,024 samples, 0.30%)</title><rect x="1017.0" y="85" width="3.5" height="15.0" fill="rgb(214,72,49)" rx="2" ry="2" />
+<text  x="1019.98" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::insert (313,371 samples, 30.74%)</title><rect x="599.0" y="149" width="362.7" height="15.0" fill="rgb(222,17,2)" rx="2" ry="2" />
+<text  x="601.96" y="159.5" >sudachi::lattice::Lattice::insert</text>
+</g>
+<g >
+<title>&lt;regex::exec::ExecNoSync as regex::re_trait::RegularExpression&gt;::captures_read_at (4,560 samples, 0.45%)</title><rect x="142.6" y="85" width="5.3" height="15.0" fill="rgb(222,112,41)" rx="2" ry="2" />
+<text  x="145.64" y="95.5" ></text>
+</g>
+<g >
+<title>alloc::str::&lt;impl str&gt;::to_lowercase (1,307 samples, 0.13%)</title><rect x="384.3" y="149" width="1.5" height="15.0" fill="rgb(208,93,2)" rx="2" ry="2" />
+<text  x="387.28" y="159.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (570 samples, 0.06%)</title><rect x="128.5" y="181" width="0.7" height="15.0" fill="rgb(205,124,14)" rx="2" ry="2" />
+<text  x="131.51" y="191.5" ></text>
+</g>
+<g >
+<title>&lt; (25,279 samples, 2.48%)</title><rect x="984.5" y="101" width="29.3" height="15.0" fill="rgb(251,135,51)" rx="2" ry="2" />
+<text  x="987.50" y="111.5" >&lt;</text>
+</g>
+<g >
+<title>__rdl_alloc (497 samples, 0.05%)</title><rect x="1003.8" y="85" width="0.5" height="15.0" fill="rgb(222,108,1)" rx="2" ry="2" />
+<text  x="1006.77" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::iter::traits::collect::FromIterator&lt;char&gt;&gt;::from_iter (16,054 samples, 1.57%)</title><rect x="282.5" y="133" width="18.6" height="15.0" fill="rgb(243,44,8)" rx="2" ry="2" />
+<text  x="285.49" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_cost (663 samples, 0.07%)</title><rect x="490.7" y="133" width="0.8" height="15.0" fill="rgb(215,30,3)" rx="2" ry="2" />
+<text  x="493.70" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (56,898 samples, 5.58%)</title><rect x="872.3" y="85" width="65.9" height="15.0" fill="rgb(238,131,10)" rx="2" ry="2" />
+<text  x="875.33" y="95.5" >&lt;std::c..</text>
+</g>
+<g >
+<title>sudachi::plugin::oov::OovProviderPlugin::get_oov (17,457 samples, 1.71%)</title><rect x="1023.2" y="149" width="20.3" height="15.0" fill="rgb(247,134,51)" rx="2" ry="2" />
+<text  x="1026.24" y="159.5" ></text>
+</g>
+<g >
+<title>__fget_light (290 samples, 0.03%)</title><rect x="134.9" y="69" width="0.3" height="15.0" fill="rgb(227,204,26)" rx="2" ry="2" />
+<text  x="137.89" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (409 samples, 0.04%)</title><rect x="329.4" y="117" width="0.5" height="15.0" fill="rgb(208,39,11)" rx="2" ry="2" />
+<text  x="332.39" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::raw::RawIterHash&lt;T,A&gt; as core::iter::traits::iterator::Iterator&gt;::next (526 samples, 0.05%)</title><rect x="326.8" y="133" width="0.6" height="15.0" fill="rgb(219,136,17)" rx="2" ry="2" />
+<text  x="329.83" y="143.5" ></text>
+</g>
+<g >
+<title>_int_realloc (4,782 samples, 0.47%)</title><rect x="1114.3" y="245" width="5.5" height="15.0" fill="rgb(228,119,50)" rx="2" ry="2" />
+<text  x="1117.27" y="255.5" ></text>
+</g>
+<g >
+<title>sudachi::main (818,507 samples, 80.29%)</title><rect x="129.6" y="181" width="947.4" height="15.0" fill="rgb(246,42,4)" rx="2" ry="2" />
+<text  x="132.62" y="191.5" >sudachi::main</text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (1,522 samples, 0.15%)</title><rect x="322.5" y="133" width="1.8" height="15.0" fill="rgb(235,100,11)" rx="2" ry="2" />
+<text  x="325.55" y="143.5" ></text>
+</g>
+<g >
+<title>regex::dfa::Fsm::next_state (1,562 samples, 0.15%)</title><rect x="236.7" y="53" width="1.8" height="15.0" fill="rgb(208,30,21)" rx="2" ry="2" />
+<text  x="239.67" y="63.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (20,177 samples, 1.98%)</title><rect x="938.3" y="101" width="23.4" height="15.0" fill="rgb(231,13,12)" rx="2" ry="2" />
+<text  x="941.34" y="111.5" >n..</text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_infos::WordInfos::get_word_info (37,192 samples, 3.65%)</title><rect x="977.7" y="117" width="43.0" height="15.0" fill="rgb(253,149,0)" rx="2" ry="2" />
+<text  x="980.67" y="127.5" >suda..</text>
+</g>
+<g >
+<title>fancy_regex::vm::State::pop (828 samples, 0.08%)</title><rect x="150.9" y="101" width="0.9" height="15.0" fill="rgb(221,30,50)" rx="2" ry="2" />
+<text  x="153.89" y="111.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::shortest_match_at (30,799 samples, 3.02%)</title><rect x="212.6" y="69" width="35.7" height="15.0" fill="rgb(221,206,45)" rx="2" ry="2" />
+<text  x="215.63" y="79.5" >reg..</text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (348 samples, 0.03%)</title><rect x="1013.8" y="101" width="0.4" height="15.0" fill="rgb(210,153,15)" rx="2" ry="2" />
+<text  x="1016.76" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (2,139 samples, 0.21%)</title><rect x="614.8" y="117" width="2.5" height="15.0" fill="rgb(221,1,13)" rx="2" ry="2" />
+<text  x="617.84" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;K,V,S,A&gt; as core::iter::traits::collect::Extend&lt; (2,774 samples, 0.27%)</title><rect x="339.5" y="117" width="3.2" height="15.0" fill="rgb(218,141,18)" rx="2" ry="2" />
+<text  x="342.49" y="127.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::HashMap&lt;K,V,S,A&gt;::insert (1,227 samples, 0.12%)</title><rect x="338.1" y="101" width="1.4" height="15.0" fill="rgb(221,26,9)" rx="2" ry="2" />
+<text  x="341.06" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (5,829 samples, 0.57%)</title><rect x="755.6" y="101" width="6.7" height="15.0" fill="rgb(221,149,9)" rx="2" ry="2" />
+<text  x="758.59" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;std::io::Write::write_fmt::Adaptor&lt;T&gt; as core::fmt::Write&gt;::write_str (688 samples, 0.07%)</title><rect x="10.4" y="245" width="0.8" height="15.0" fill="rgb(241,57,48)" rx="2" ry="2" />
+<text  x="13.43" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1,640 samples, 0.16%)</title><rect x="596.2" y="133" width="1.9" height="15.0" fill="rgb(247,84,11)" rx="2" ry="2" />
+<text  x="599.23" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::new (4,611 samples, 0.45%)</title><rect x="961.7" y="149" width="5.3" height="15.0" fill="rgb(207,87,2)" rx="2" ry="2" />
+<text  x="964.69" y="159.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::Lexicon::get_word_param (57,513 samples, 5.64%)</title><rect x="424.1" y="133" width="66.6" height="15.0" fill="rgb(245,207,22)" rx="2" ry="2" />
+<text  x="427.13" y="143.5" >sudachi..</text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (2,611 samples, 0.26%)</title><rect x="496.1" y="133" width="3.0" height="15.0" fill="rgb(222,18,13)" rx="2" ry="2" />
+<text  x="499.09" y="143.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (411 samples, 0.04%)</title><rect x="335.7" y="101" width="0.5" height="15.0" fill="rgb(212,181,16)" rx="2" ry="2" />
+<text  x="338.70" y="111.5" ></text>
+</g>
+<g >
+<title>__rdl_alloc (471 samples, 0.05%)</title><rect x="382.0" y="149" width="0.6" height="15.0" fill="rgb(253,212,21)" rx="2" ry="2" />
+<text  x="385.03" y="159.5" ></text>
+</g>
+<g >
+<title>__rdl_realloc (319 samples, 0.03%)</title><rect x="510.4" y="101" width="0.4" height="15.0" fill="rgb(234,86,50)" rx="2" ry="2" />
+<text  x="513.43" y="111.5" ></text>
+</g>
+<g >
+<title>_int_malloc (4,344 samples, 0.43%)</title><rect x="1109.2" y="245" width="5.1" height="15.0" fill="rgb(221,153,11)" rx="2" ry="2" />
+<text  x="1112.24" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::chain::Chain&lt;A,B&gt; as core::iter::traits::iterator::Iterator&gt;::next (5,005 samples, 0.49%)</title><rect x="574.4" y="117" width="5.8" height="15.0" fill="rgb(205,216,32)" rx="2" ry="2" />
+<text  x="577.43" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::grammar::Grammar::get_connect_cost (251,275 samples, 24.65%)</title><rect x="670.8" y="117" width="290.9" height="15.0" fill="rgb(209,34,10)" rx="2" ry="2" />
+<text  x="673.84" y="127.5" >sudachi::dic::grammar::Grammar::get_con..</text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (1,501 samples, 0.15%)</title><rect x="1017.4" y="69" width="1.8" height="15.0" fill="rgb(251,108,27)" rx="2" ry="2" />
+<text  x="1020.42" y="79.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (733 samples, 0.07%)</title><rect x="497.9" y="117" width="0.9" height="15.0" fill="rgb(237,59,39)" rx="2" ry="2" />
+<text  x="500.95" y="127.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (759 samples, 0.07%)</title><rect x="1067.9" y="165" width="0.9" height="15.0" fill="rgb(221,167,44)" rx="2" ry="2" />
+<text  x="1070.93" y="175.5" ></text>
+</g>
+<g >
+<title>regex::exec::ExecNoSync::exec_nfa (1,386 samples, 0.14%)</title><rect x="146.3" y="69" width="1.6" height="15.0" fill="rgb(212,169,29)" rx="2" ry="2" />
+<text  x="149.28" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;fancy_regex::CaptureMatches as core::iter::traits::iterator::Iterator&gt;::next (5,824 samples, 0.57%)</title><rect x="141.3" y="133" width="6.7" height="15.0" fill="rgb(206,228,18)" rx="2" ry="2" />
+<text  x="144.30" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (1,727 samples, 0.17%)</title><rect x="313.4" y="117" width="2.0" height="15.0" fill="rgb(254,192,5)" rx="2" ry="2" />
+<text  x="316.36" y="127.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (636 samples, 0.06%)</title><rect x="490.0" y="101" width="0.7" height="15.0" fill="rgb(214,175,38)" rx="2" ry="2" />
+<text  x="492.96" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (626 samples, 0.06%)</title><rect x="1038.7" y="117" width="0.7" height="15.0" fill="rgb(222,199,18)" rx="2" ry="2" />
+<text  x="1041.70" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::dic::dictionary::JapaneseDictionary as sudachi::stateless_tokeniser::DictionaryAccess&gt;::lexicon (693 samples, 0.07%)</title><rect x="136.6" y="165" width="0.8" height="15.0" fill="rgb(226,55,3)" rx="2" ry="2" />
+<text  x="139.64" y="175.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (1,041 samples, 0.10%)</title><rect x="1121.4" y="245" width="1.2" height="15.0" fill="rgb(222,136,52)" rx="2" ry="2" />
+<text  x="1124.39" y="255.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::shortest_match_at (395 samples, 0.04%)</title><rect x="248.3" y="85" width="0.4" height="15.0" fill="rgb(247,222,8)" rx="2" ry="2" />
+<text  x="251.28" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (853 samples, 0.08%)</title><rect x="301.1" y="133" width="1.0" height="15.0" fill="rgb(213,29,31)" rx="2" ry="2" />
+<text  x="304.08" y="143.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (1,848 samples, 0.18%)</title><rect x="487.8" y="85" width="2.2" height="15.0" fill="rgb(221,122,25)" rx="2" ry="2" />
+<text  x="490.82" y="95.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (151,952 samples, 14.91%)</title><rect x="762.5" y="101" width="175.8" height="15.0" fill="rgb(252,136,19)" rx="2" ry="2" />
+<text  x="765.45" y="111.5" >hashbrown::map::make_h..</text>
+</g>
+<g >
+<title>[unknown] (98,164 samples, 9.63%)</title><rect x="11.8" y="245" width="113.6" height="15.0" fill="rgb(206,124,40)" rx="2" ry="2" />
+<text  x="14.82" y="255.5" >[unknown]</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::chain::Chain&lt;A,B&gt; as core::iter::traits::iterator::Iterator&gt;::next (5,470 samples, 0.54%)</title><rect x="583.6" y="117" width="6.4" height="15.0" fill="rgb(218,75,43)" rx="2" ry="2" />
+<text  x="586.63" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::sentence_splitter::SentenceIter as core::iter::traits::iterator::Iterator&gt;::next (97,039 samples, 9.52%)</title><rect x="138.1" y="165" width="112.3" height="15.0" fill="rgb(243,126,2)" rx="2" ry="2" />
+<text  x="141.12" y="175.5" >&lt;sudachi::sen..</text>
+</g>
+<g >
+<title>sudachi::plugin::oov::OovProviderPlugin::get_oov (407 samples, 0.04%)</title><rect x="1076.5" y="165" width="0.5" height="15.0" fill="rgb(218,32,23)" rx="2" ry="2" />
+<text  x="1079.54" y="175.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::dic::lexicon::word_infos::WordInfo&gt; (537 samples, 0.05%)</title><rect x="414.8" y="149" width="0.6" height="15.0" fill="rgb(244,120,31)" rx="2" ry="2" />
+<text  x="417.81" y="159.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (1,510 samples, 0.15%)</title><rect x="1066.2" y="165" width="1.7" height="15.0" fill="rgb(223,31,27)" rx="2" ry="2" />
+<text  x="1069.19" y="175.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::DictionaryLoader::read_dictionary (373 samples, 0.04%)</title><rect x="1071.2" y="117" width="0.4" height="15.0" fill="rgb(252,28,16)" rx="2" ry="2" />
+<text  x="1074.19" y="127.5" ></text>
+</g>
+<g >
+<title>alloc::string::String::push (570 samples, 0.06%)</title><rect x="1009.7" y="85" width="0.7" height="15.0" fill="rgb(246,55,31)" rx="2" ry="2" />
+<text  x="1012.71" y="95.5" ></text>
+</g>
+<g >
+<title>unicode_normalization::lookups::canonical_fully_decomposed (920 samples, 0.09%)</title><rect x="294.0" y="101" width="1.0" height="15.0" fill="rgb(207,190,0)" rx="2" ry="2" />
+<text  x="296.97" y="111.5" ></text>
+</g>
+<g >
+<title>regex::backtrack::Bounded&lt;I&gt;::exec (1,194 samples, 0.12%)</title><rect x="146.5" y="53" width="1.4" height="15.0" fill="rgb(247,161,47)" rx="2" ry="2" />
+<text  x="149.48" y="63.5" ></text>
+</g>
+<g >
+<title>[unknown] (806 samples, 0.08%)</title><rect x="11.9" y="197" width="0.9" height="15.0" fill="rgb(220,75,48)" rx="2" ry="2" />
+<text  x="14.85" y="207.5" ></text>
+</g>
+<g >
+<title>alloc::str::&lt;impl str&gt;::to_lowercase (458 samples, 0.04%)</title><rect x="1122.6" y="245" width="0.5" height="15.0" fill="rgb(240,75,54)" rx="2" ry="2" />
+<text  x="1125.60" y="255.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (6,800 samples, 0.67%)</title><rect x="663.0" y="117" width="7.8" height="15.0" fill="rgb(251,218,24)" rx="2" ry="2" />
+<text  x="665.97" y="127.5" ></text>
+</g>
+<g >
+<title>std::io::BufRead::read_line (1,360 samples, 0.13%)</title><rect x="132.7" y="149" width="1.6" height="15.0" fill="rgb(240,166,27)" rx="2" ry="2" />
+<text  x="135.71" y="159.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (3,413 samples, 0.33%)</title><rect x="410.8" y="133" width="4.0" height="15.0" fill="rgb(244,169,0)" rx="2" ry="2" />
+<text  x="413.82" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;regex_syntax::hir::literal::Literal as core::ops::deref::Deref&gt;::deref (1,696 samples, 0.17%)</title><rect x="228.8" y="53" width="1.9" height="15.0" fill="rgb(226,106,44)" rx="2" ry="2" />
+<text  x="231.76" y="63.5" ></text>
+</g>
+<g >
+<title>unicode_normalization::lookups::canonical_combining_class (1,418 samples, 0.14%)</title><rect x="292.3" y="101" width="1.7" height="15.0" fill="rgb(238,73,50)" rx="2" ry="2" />
+<text  x="295.33" y="111.5" ></text>
+</g>
+<g >
+<title>fancy_regex::vm::State::save (10,879 samples, 1.07%)</title><rect x="190.0" y="85" width="12.6" height="15.0" fill="rgb(238,60,25)" rx="2" ry="2" />
+<text  x="192.97" y="95.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (319 samples, 0.03%)</title><rect x="140.9" y="117" width="0.4" height="15.0" fill="rgb(240,128,35)" rx="2" ry="2" />
+<text  x="143.91" y="127.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (6,866 samples, 0.67%)</title><rect x="1128.0" y="245" width="8.0" height="15.0" fill="rgb(225,59,40)" rx="2" ry="2" />
+<text  x="1131.01" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (7,918 samples, 0.78%)</title><rect x="1077.2" y="245" width="9.2" height="15.0" fill="rgb(222,44,17)" rx="2" ry="2" />
+<text  x="1080.24" y="255.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u32 (312 samples, 0.03%)</title><rect x="1013.4" y="85" width="0.4" height="15.0" fill="rgb(243,88,37)" rx="2" ry="2" />
+<text  x="1016.40" y="95.5" ></text>
+</g>
+<g >
+<title>malloc (1,108 samples, 0.11%)</title><rect x="1011.6" y="85" width="1.3" height="15.0" fill="rgb(253,213,22)" rx="2" ry="2" />
+<text  x="1014.58" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::Lexicon::new (366 samples, 0.04%)</title><rect x="1071.2" y="101" width="0.4" height="15.0" fill="rgb(246,90,19)" rx="2" ry="2" />
+<text  x="1074.20" y="111.5" ></text>
+</g>
+<g >
+<title>std::rt::lang_start_internal (822,275 samples, 80.66%)</title><rect x="125.4" y="229" width="951.8" height="15.0" fill="rgb(234,15,20)" rx="2" ry="2" />
+<text  x="128.45" y="239.5" >std::rt::lang_start_internal</text>
+</g>
+<g >
+<title>alloc::vec::from_elem (1,332 samples, 0.13%)</title><rect x="588.2" y="101" width="1.5" height="15.0" fill="rgb(247,215,31)" rx="2" ry="2" />
+<text  x="591.21" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::string::String::from_utf16 (532 samples, 0.05%)</title><rect x="1019.4" y="69" width="0.6" height="15.0" fill="rgb(223,169,53)" rx="2" ry="2" />
+<text  x="1022.35" y="79.5" ></text>
+</g>
+<g >
+<title>alloc::vec::from_elem (1,281 samples, 0.13%)</title><rect x="578.5" y="101" width="1.5" height="15.0" fill="rgb(220,16,2)" rx="2" ry="2" />
+<text  x="581.53" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (1,009 samples, 0.10%)</title><rect x="973.0" y="117" width="1.2" height="15.0" fill="rgb(230,32,8)" rx="2" ry="2" />
+<text  x="976.01" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_right_id (526 samples, 0.05%)</title><rect x="492.1" y="133" width="0.6" height="15.0" fill="rgb(207,219,18)" rx="2" ry="2" />
+<text  x="495.06" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (592 samples, 0.06%)</title><rect x="298.2" y="101" width="0.7" height="15.0" fill="rgb(210,174,48)" rx="2" ry="2" />
+<text  x="301.22" y="111.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon_set::LexiconSet::get_word_param (531 samples, 0.05%)</title><rect x="1071.6" y="165" width="0.6" height="15.0" fill="rgb(219,188,46)" rx="2" ry="2" />
+<text  x="1074.63" y="175.5" ></text>
+</g>
+<g >
+<title>core::fmt::Formatter::pad (2,040 samples, 0.20%)</title><rect x="1136.0" y="245" width="2.3" height="15.0" fill="rgb(241,202,16)" rx="2" ry="2" />
+<text  x="1138.96" y="255.5" ></text>
+</g>
+<g >
+<title>sudachi::plugin::path_rewrite::PathRewritePlugin::concatenate (1,390 samples, 0.14%)</title><rect x="335.0" y="117" width="1.6" height="15.0" fill="rgb(209,66,27)" rx="2" ry="2" />
+<text  x="337.97" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::oov::mecab_oov::MeCabOovPlugin as sudachi::plugin::oov::OovProviderPlugin&gt;::provide_oov (13,620 samples, 1.34%)</title><rect x="1025.6" y="133" width="15.8" height="15.0" fill="rgb(219,32,47)" rx="2" ry="2" />
+<text  x="1028.65" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (2,929 samples, 0.29%)</title><rect x="461.7" y="85" width="3.4" height="15.0" fill="rgb(214,189,22)" rx="2" ry="2" />
+<text  x="464.74" y="95.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1,336 samples, 0.13%)</title><rect x="1014.3" y="101" width="1.6" height="15.0" fill="rgb(249,170,39)" rx="2" ry="2" />
+<text  x="1017.30" y="111.5" ></text>
+</g>
+<g >
+<title>fancy_regex::vm::run (82,363 samples, 8.08%)</title><rect x="153.4" y="101" width="95.3" height="15.0" fill="rgb(224,96,41)" rx="2" ry="2" />
+<text  x="156.40" y="111.5" >fancy_regex..</text>
+</g>
+<g >
+<title>sudachi::plugin::path_rewrite::join_numeric::JoinNumericPlugin::concat (1,800 samples, 0.18%)</title><rect x="334.5" y="133" width="2.1" height="15.0" fill="rgb(252,66,26)" rx="2" ry="2" />
+<text  x="337.52" y="143.5" ></text>
+</g>
+<g >
+<title>sudachi::sentence_detector::SentenceDetector::get_eos (96,635 samples, 9.48%)</title><rect x="138.6" y="149" width="111.8" height="15.0" fill="rgb(245,220,47)" rx="2" ry="2" />
+<text  x="141.59" y="159.5" >sudachi::sent..</text>
+</g>
+<g >
+<title>core::ptr::drop_in_place&lt;sudachi::error::SudachiError&gt; (1,721 samples, 0.17%)</title><rect x="512.8" y="117" width="2.0" height="15.0" fill="rgb(230,190,1)" rx="2" ry="2" />
+<text  x="515.84" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (302 samples, 0.03%)</title><rect x="249.3" y="133" width="0.4" height="15.0" fill="rgb(251,4,33)" rx="2" ry="2" />
+<text  x="252.32" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::iter::traits::collect::FromIterator&lt;char&gt;&gt;::from_iter (1,949 samples, 0.19%)</title><rect x="139.0" y="133" width="2.3" height="15.0" fill="rgb(215,210,42)" rx="2" ry="2" />
+<text  x="142.05" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (972 samples, 0.10%)</title><rect x="400.1" y="101" width="1.1" height="15.0" fill="rgb(235,171,16)" rx="2" ry="2" />
+<text  x="403.12" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (1,472 samples, 0.14%)</title><rect x="297.4" y="117" width="1.7" height="15.0" fill="rgb(222,28,27)" rx="2" ry="2" />
+<text  x="300.43" y="127.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (694 samples, 0.07%)</title><rect x="1002.9" y="69" width="0.8" height="15.0" fill="rgb(229,170,8)" rx="2" ry="2" />
+<text  x="1005.89" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (786 samples, 0.08%)</title><rect x="321.2" y="133" width="0.9" height="15.0" fill="rgb(224,159,23)" rx="2" ry="2" />
+<text  x="324.21" y="143.5" ></text>
+</g>
+<g >
+<title>hashbrown::raw::RawTable&lt;T,A&gt;::insert (634 samples, 0.06%)</title><rect x="341.5" y="85" width="0.7" height="15.0" fill="rgb(253,176,43)" rx="2" ry="2" />
+<text  x="344.45" y="95.5" ></text>
+</g>
+<g >
+<title>unlink_chunk.constprop.0 (8,074 samples, 0.79%)</title><rect x="116.1" y="229" width="9.3" height="15.0" fill="rgb(217,109,20)" rx="2" ry="2" />
+<text  x="119.10" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (2,084 samples, 0.20%)</title><rect x="392.3" y="101" width="2.4" height="15.0" fill="rgb(233,91,42)" rx="2" ry="2" />
+<text  x="395.26" y="111.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::node::Node::fill_word_info (46,385 samples, 4.55%)</title><rect x="967.0" y="149" width="53.7" height="15.0" fill="rgb(226,169,20)" rx="2" ry="2" />
+<text  x="970.03" y="159.5" >sudac..</text>
+</g>
+<g >
+<title>vfs_write (499 samples, 0.05%)</title><rect x="135.2" y="85" width="0.6" height="15.0" fill="rgb(251,39,22)" rx="2" ry="2" />
+<text  x="138.23" y="95.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u32 (1,985 samples, 0.19%)</title><rect x="555.3" y="85" width="2.3" height="15.0" fill="rgb(241,101,53)" rx="2" ry="2" />
+<text  x="558.32" y="95.5" ></text>
+</g>
+<g >
+<title>_int_free (18,804 samples, 1.84%)</title><rect x="1087.5" y="245" width="21.7" height="15.0" fill="rgb(225,116,51)" rx="2" ry="2" />
+<text  x="1090.48" y="255.5" >_..</text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (1,597 samples, 0.16%)</title><rect x="446.2" y="85" width="1.8" height="15.0" fill="rgb(240,9,11)" rx="2" ry="2" />
+<text  x="449.18" y="95.5" ></text>
+</g>
+<g >
+<title>core::unicode::unicode_data::conversions::to_lower (2,570 samples, 0.25%)</title><rect x="415.9" y="149" width="3.0" height="15.0" fill="rgb(240,158,23)" rx="2" ry="2" />
+<text  x="418.93" y="159.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (986 samples, 0.10%)</title><rect x="499.3" y="133" width="1.1" height="15.0" fill="rgb(229,96,48)" rx="2" ry="2" />
+<text  x="502.28" y="143.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::find (7,333 samples, 0.72%)</title><rect x="202.6" y="85" width="8.5" height="15.0" fill="rgb(224,69,29)" rx="2" ry="2" />
+<text  x="205.58" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::plugin::path_rewrite::join_numeric::numeric_parser::NumericParser::new (6,368 samples, 0.62%)</title><rect x="337.4" y="133" width="7.4" height="15.0" fill="rgb(247,202,24)" rx="2" ry="2" />
+<text  x="340.42" y="143.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (2,009 samples, 0.20%)</title><rect x="327.5" y="133" width="2.4" height="15.0" fill="rgb(233,118,18)" rx="2" ry="2" />
+<text  x="330.55" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;fancy_regex::Matches as core::iter::traits::iterator::Iterator&gt;::next (87,496 samples, 8.58%)</title><rect x="148.0" y="133" width="101.3" height="15.0" fill="rgb(235,181,44)" rx="2" ry="2" />
+<text  x="151.05" y="143.5" >&lt;fancy_regex..</text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::find_at (7,013 samples, 0.69%)</title><rect x="203.0" y="69" width="8.1" height="15.0" fill="rgb(211,56,43)" rx="2" ry="2" />
+<text  x="205.95" y="79.5" ></text>
+</g>
+<g >
+<title>nom::number::complete::le_u16 (463 samples, 0.05%)</title><rect x="1012.9" y="85" width="0.5" height="15.0" fill="rgb(252,29,53)" rx="2" ry="2" />
+<text  x="1015.87" y="95.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (6,262 samples, 0.61%)</title><rect x="308.1" y="133" width="7.3" height="15.0" fill="rgb(222,177,41)" rx="2" ry="2" />
+<text  x="311.12" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::dic::category_type::CategoryType as core::hash::Hash&gt;::hash (908 samples, 0.09%)</title><rect x="1036.6" y="117" width="1.1" height="15.0" fill="rgb(207,124,2)" rx="2" ry="2" />
+<text  x="1039.62" y="127.5" ></text>
+</g>
+<g >
+<title>malloc (271 samples, 0.03%)</title><rect x="498.8" y="117" width="0.3" height="15.0" fill="rgb(224,199,4)" rx="2" ry="2" />
+<text  x="501.80" y="127.5" ></text>
+</g>
+<g >
+<title>__memcmp_sse4_1 (5,117 samples, 0.50%)</title><rect x="230.7" y="53" width="5.9" height="15.0" fill="rgb(207,186,25)" rx="2" ry="2" />
+<text  x="233.72" y="63.5" ></text>
+</g>
+<g >
+<title>__rust_dealloc (357 samples, 0.04%)</title><rect x="1004.7" y="85" width="0.4" height="15.0" fill="rgb(243,125,39)" rx="2" ry="2" />
+<text  x="1007.68" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::word_params::WordParams::get_right_id (10,083 samples, 0.99%)</title><rect x="479.0" y="117" width="11.7" height="15.0" fill="rgb(221,1,51)" rx="2" ry="2" />
+<text  x="482.03" y="127.5" ></text>
+</g>
+<g >
+<title>__rdl_alloc (347 samples, 0.03%)</title><rect x="536.6" y="85" width="0.4" height="15.0" fill="rgb(249,228,53)" rx="2" ry="2" />
+<text  x="539.60" y="95.5" ></text>
+</g>
+<g >
+<title>fancy_regex::Regex::captures_from_pos (5,551 samples, 0.54%)</title><rect x="141.5" y="117" width="6.5" height="15.0" fill="rgb(220,89,21)" rx="2" ry="2" />
+<text  x="144.55" y="127.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (3,242 samples, 0.32%)</title><rect x="967.8" y="133" width="3.8" height="15.0" fill="rgb(248,96,51)" rx="2" ry="2" />
+<text  x="970.80" y="143.5" ></text>
+</g>
+<g >
+<title>regex::exec::ExecNoSync::is_anchor_end_match::imp (404 samples, 0.04%)</title><rect x="211.8" y="69" width="0.5" height="15.0" fill="rgb(215,125,33)" rx="2" ry="2" />
+<text  x="214.82" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (588 samples, 0.06%)</title><rect x="265.9" y="149" width="0.7" height="15.0" fill="rgb(248,217,15)" rx="2" ry="2" />
+<text  x="268.93" y="159.5" ></text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::is_match (31,920 samples, 3.13%)</title><rect x="211.3" y="85" width="37.0" height="15.0" fill="rgb(223,43,35)" rx="2" ry="2" />
+<text  x="214.33" y="95.5" >reg..</text>
+</g>
+<g >
+<title>std::io::append_to_string (1,097 samples, 0.11%)</title><rect x="133.0" y="133" width="1.2" height="15.0" fill="rgb(223,120,31)" rx="2" ry="2" />
+<text  x="135.98" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::dic::category_type::CategoryType as core::hash::Hash&gt;::hash (267 samples, 0.03%)</title><rect x="1025.3" y="133" width="0.3" height="15.0" fill="rgb(245,25,24)" rx="2" ry="2" />
+<text  x="1028.34" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::string::String::from_utf16 (3,994 samples, 0.39%)</title><rect x="1005.1" y="85" width="4.6" height="15.0" fill="rgb(229,176,42)" rx="2" ry="2" />
+<text  x="1008.09" y="95.5" ></text>
+</g>
+<g >
+<title>fancy_regex::vm::State::pop (7,926 samples, 0.78%)</title><rect x="180.8" y="85" width="9.2" height="15.0" fill="rgb(215,216,38)" rx="2" ry="2" />
+<text  x="183.80" y="95.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (2,300 samples, 0.23%)</title><rect x="407.5" y="117" width="2.7" height="15.0" fill="rgb(248,94,6)" rx="2" ry="2" />
+<text  x="410.50" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text::Utf8InputText::can_bow (953 samples, 0.09%)</title><rect x="1072.4" y="165" width="1.1" height="15.0" fill="rgb(245,85,28)" rx="2" ry="2" />
+<text  x="1075.36" y="175.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::node::Node::new (2,182 samples, 0.21%)</title><rect x="1020.7" y="149" width="2.5" height="15.0" fill="rgb(210,203,30)" rx="2" ry="2" />
+<text  x="1023.72" y="159.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (1,368 samples, 0.13%)</title><rect x="1119.8" y="245" width="1.6" height="15.0" fill="rgb(209,68,45)" rx="2" ry="2" />
+<text  x="1122.81" y="255.5" ></text>
+</g>
+<g >
+<title>std::io::Write::write_fmt (303 samples, 0.03%)</title><rect x="129.3" y="181" width="0.3" height="15.0" fill="rgb(238,72,3)" rx="2" ry="2" />
+<text  x="132.27" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;sudachi::plugin::oov::simple_oov::SimpleOovPlugin as sudachi::plugin::oov::OovProviderPlugin&gt;::provide_oov (480 samples, 0.05%)</title><rect x="1041.4" y="133" width="0.6" height="15.0" fill="rgb(249,164,27)" rx="2" ry="2" />
+<text  x="1044.41" y="143.5" ></text>
+</g>
+<g >
+<title>malloc_consolidate (12,198 samples, 1.20%)</title><rect x="1171.6" y="245" width="14.1" height="15.0" fill="rgb(236,34,32)" rx="2" ry="2" />
+<text  x="1174.57" y="255.5" ></text>
+</g>
+<g >
+<title>__memmove_sse2_unaligned_erms (1,627 samples, 0.16%)</title><rect x="1144.1" y="229" width="1.9" height="15.0" fill="rgb(217,47,35)" rx="2" ry="2" />
+<text  x="1147.11" y="239.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (13,833 samples, 1.36%)</title><rect x="449.1" y="101" width="16.0" height="15.0" fill="rgb(247,180,11)" rx="2" ry="2" />
+<text  x="452.14" y="111.5" ></text>
+</g>
+<g >
+<title>hashbrown::raw::RawTable&lt;T,A&gt;::reserve_rehash (362 samples, 0.04%)</title><rect x="342.2" y="101" width="0.5" height="15.0" fill="rgb(251,86,11)" rx="2" ry="2" />
+<text  x="345.25" y="111.5" ></text>
+</g>
+<g >
+<title>_int_free (24,408 samples, 2.39%)</title><rect x="14.5" y="229" width="28.2" height="15.0" fill="rgb(221,38,6)" rx="2" ry="2" />
+<text  x="17.48" y="239.5" >_..</text>
+</g>
+<g >
+<title>regex::exec::ExecNoSync::is_anchor_end_match::imp (1,686 samples, 0.17%)</title><rect x="238.5" y="53" width="1.9" height="15.0" fill="rgb(239,33,50)" rx="2" ry="2" />
+<text  x="241.47" y="63.5" ></text>
+</g>
+<g >
+<title>alloc::string::String::push (4,217 samples, 0.41%)</title><rect x="1123.1" y="245" width="4.9" height="15.0" fill="rgb(205,43,50)" rx="2" ry="2" />
+<text  x="1126.13" y="255.5" ></text>
+</g>
+<g >
+<title>[unknown] (285 samples, 0.03%)</title><rect x="11.9" y="165" width="0.3" height="15.0" fill="rgb(245,180,3)" rx="2" ry="2" />
+<text  x="14.85" y="175.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::connect_node (292,985 samples, 28.74%)</title><rect x="622.6" y="133" width="339.1" height="15.0" fill="rgb(244,63,25)" rx="2" ry="2" />
+<text  x="625.56" y="143.5" >sudachi::lattice::Lattice::connect_node</text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::insert (676 samples, 0.07%)</title><rect x="1073.8" y="165" width="0.8" height="15.0" fill="rgb(228,50,45)" rx="2" ry="2" />
+<text  x="1076.81" y="175.5" ></text>
+</g>
+<g >
+<title>regex::exec::ExecNoSync::is_anchor_end_match::imp (356 samples, 0.03%)</title><rect x="210.7" y="53" width="0.4" height="15.0" fill="rgb(235,187,39)" rx="2" ry="2" />
+<text  x="213.66" y="63.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::finish_grow (1,077 samples, 0.11%)</title><rect x="537.0" y="85" width="1.2" height="15.0" fill="rgb(225,105,24)" rx="2" ry="2" />
+<text  x="540.00" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::DefaultHasher as core::hash::Hasher&gt;::write (357 samples, 0.04%)</title><rect x="323.9" y="117" width="0.4" height="15.0" fill="rgb(222,178,24)" rx="2" ry="2" />
+<text  x="326.89" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::input_text::utf8_input_text::Utf8InputText::can_bow (3,987 samples, 0.39%)</title><rect x="559.6" y="149" width="4.6" height="15.0" fill="rgb(218,95,28)" rx="2" ry="2" />
+<text  x="562.56" y="159.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (336 samples, 0.03%)</title><rect x="591.1" y="117" width="0.4" height="15.0" fill="rgb(220,14,34)" rx="2" ry="2" />
+<text  x="594.13" y="127.5" ></text>
+</g>
+<g >
+<title>malloc (371 samples, 0.04%)</title><rect x="977.2" y="117" width="0.5" height="15.0" fill="rgb(243,6,5)" rx="2" ry="2" />
+<text  x="980.24" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;T&gt; as alloc::vec::spec_from_iter::SpecFromIter&lt;T,I&gt;&gt;::from_iter (17,887 samples, 1.75%)</title><rect x="390.0" y="133" width="20.7" height="15.0" fill="rgb(210,6,26)" rx="2" ry="2" />
+<text  x="393.02" y="143.5" ></text>
+</g>
+<g >
+<title>__fdget_pos (306 samples, 0.03%)</title><rect x="134.9" y="85" width="0.3" height="15.0" fill="rgb(222,182,41)" rx="2" ry="2" />
+<text  x="137.87" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon_set::LexiconSet::get_word_param (61,699 samples, 6.05%)</title><rect x="421.3" y="149" width="71.4" height="15.0" fill="rgb(211,189,46)" rx="2" ry="2" />
+<text  x="424.26" y="159.5" >sudachi:..</text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (3,531 samples, 0.35%)</title><rect x="385.8" y="149" width="4.1" height="15.0" fill="rgb(217,178,48)" rx="2" ry="2" />
+<text  x="388.84" y="159.5" ></text>
+</g>
+<g >
+<title>[unknown] (738 samples, 0.07%)</title><rect x="11.9" y="181" width="0.8" height="15.0" fill="rgb(212,34,32)" rx="2" ry="2" />
+<text  x="14.85" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (333 samples, 0.03%)</title><rect x="1071.2" y="85" width="0.4" height="15.0" fill="rgb(209,109,46)" rx="2" ry="2" />
+<text  x="1074.20" y="95.5" ></text>
+</g>
+<g >
+<title>alloc::raw_vec::RawVec&lt;T,A&gt;::reserve::do_reserve_and_handle (2,587 samples, 0.25%)</title><rect x="535.7" y="101" width="3.0" height="15.0" fill="rgb(250,2,37)" rx="2" ry="2" />
+<text  x="538.66" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (605 samples, 0.06%)</title><rect x="343.6" y="101" width="0.7" height="15.0" fill="rgb(210,99,24)" rx="2" ry="2" />
+<text  x="346.63" y="111.5" ></text>
+</g>
+<g >
+<title>alloc::slice::merge_sort (587 samples, 0.06%)</title><rect x="291.6" y="101" width="0.7" height="15.0" fill="rgb(225,36,41)" rx="2" ry="2" />
+<text  x="294.64" y="111.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::dictionary::JapaneseDictionary::from_cfg (377 samples, 0.04%)</title><rect x="1071.2" y="165" width="0.4" height="15.0" fill="rgb(240,26,37)" rx="2" ry="2" />
+<text  x="1074.19" y="175.5" ></text>
+</g>
+<g >
+<title>[unknown] (1,346 samples, 0.13%)</title><rect x="11.8" y="213" width="1.6" height="15.0" fill="rgb(222,135,16)" rx="2" ry="2" />
+<text  x="14.85" y="223.5" ></text>
+</g>
+<g >
+<title>_int_realloc (977 samples, 0.10%)</title><rect x="108.6" y="229" width="1.2" height="15.0" fill="rgb(250,19,2)" rx="2" ry="2" />
+<text  x="111.64" y="239.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon_set::LexiconSet::get_word_info (42,266 samples, 4.15%)</title><rect x="971.8" y="133" width="48.9" height="15.0" fill="rgb(244,168,9)" rx="2" ry="2" />
+<text  x="974.80" y="143.5" >suda..</text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (1,038 samples, 0.10%)</title><rect x="1010.4" y="85" width="1.2" height="15.0" fill="rgb(225,8,29)" rx="2" ry="2" />
+<text  x="1013.38" y="95.5" ></text>
+</g>
+<g >
+<title>cfree@GLIBC_2.2.5 (512 samples, 0.05%)</title><rect x="270.6" y="133" width="0.6" height="15.0" fill="rgb(246,52,36)" rx="2" ry="2" />
+<text  x="273.57" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::vec::from_elem (4,325 samples, 0.42%)</title><rect x="962.0" y="133" width="5.0" height="15.0" fill="rgb(205,78,22)" rx="2" ry="2" />
+<text  x="964.97" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;F as nom::internal::Parser&lt;I,O,E&gt;&gt;::parse (9,157 samples, 0.90%)</title><rect x="547.0" y="101" width="10.6" height="15.0" fill="rgb(228,135,15)" rx="2" ry="2" />
+<text  x="550.02" y="111.5" ></text>
+</g>
+<g >
+<title>fancy_regex::vm::State::save (1,343 samples, 0.13%)</title><rect x="151.8" y="101" width="1.6" height="15.0" fill="rgb(234,11,5)" rx="2" ry="2" />
+<text  x="154.85" y="111.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (290 samples, 0.03%)</title><rect x="592.3" y="117" width="0.3" height="15.0" fill="rgb(213,6,29)" rx="2" ry="2" />
+<text  x="595.28" y="127.5" ></text>
+</g>
+<g >
+<title>sudachi::dic::lexicon::Lexicon::lookup (50,824 samples, 4.99%)</title><rect x="500.4" y="133" width="58.9" height="15.0" fill="rgb(241,117,1)" rx="2" ry="2" />
+<text  x="503.42" y="143.5" >sudach..</text>
+</g>
+<g >
+<title>regex::re_unicode::Regex::captures_read_at (4,765 samples, 0.47%)</title><rect x="142.5" y="101" width="5.5" height="15.0" fill="rgb(210,35,9)" rx="2" ry="2" />
+<text  x="145.46" y="111.5" ></text>
+</g>
+<g >
+<title>unlink_chunk.constprop.0 (3,214 samples, 0.32%)</title><rect x="1186.3" y="245" width="3.7" height="15.0" fill="rgb(240,203,27)" rx="2" ry="2" />
+<text  x="1189.28" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;std::io::Write::write_fmt::Adaptor&lt;T&gt; as core::fmt::Write&gt;::write_str (2,962 samples, 0.29%)</title><rect x="1140.7" y="229" width="3.4" height="15.0" fill="rgb(242,64,32)" rx="2" ry="2" />
+<text  x="1143.68" y="239.5" ></text>
+</g>
+<g >
+<title>hashbrown::map::make_hash (396 samples, 0.04%)</title><rect x="418.9" y="149" width="0.5" height="15.0" fill="rgb(241,43,0)" rx="2" ry="2" />
+<text  x="421.90" y="159.5" ></text>
+</g>
+<g >
+<title>hashbrown::raw::RawTable&lt;T,A&gt;::insert (395 samples, 0.04%)</title><rect x="339.0" y="85" width="0.5" height="15.0" fill="rgb(212,10,46)" rx="2" ry="2" />
+<text  x="342.03" y="95.5" ></text>
+</g>
+<g >
+<title>sudachi::lattice::Lattice::connect_node (374 samples, 0.04%)</title><rect x="592.7" y="149" width="0.4" height="15.0" fill="rgb(239,135,21)" rx="2" ry="2" />
+<text  x="595.66" y="159.5" ></text>
+</g>
+<g >
+<title>malloc (353 samples, 0.03%)</title><rect x="558.0" y="101" width="0.5" height="15.0" fill="rgb(244,94,1)" rx="2" ry="2" />
+<text  x="561.05" y="111.5" ></text>
+</g>
+<g >
+<title>std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::h0ee822a51810071c (822,275 samples, 80.66%)</title><rect x="125.4" y="213" width="951.8" height="15.0" fill="rgb(220,27,25)" rx="2" ry="2" />
+<text  x="128.45" y="223.5" >std::rt::lang_start::_$u7b$$u7b$closure$u7d$$u7d$::h0ee822a51810071c</text>
+</g>
+</g>
+</svg>
